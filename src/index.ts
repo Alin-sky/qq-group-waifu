@@ -7,8 +7,6 @@
  * - 生成趣味表情图（摸头、结婚等）
  * - 定时清理匹配数据
  * 
- * @author Matrix Agent
- * @version 1.0.0
  */
 
 // 导入 Koishi 框架核心模块
