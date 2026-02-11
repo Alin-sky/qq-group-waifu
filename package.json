@@ -1,5 +1,5 @@
 {
-  "name": "koishi-plugin-tianqi",
+  "name": "koishi-plugin-qq-wife",
   "description": "",
   "version": "0.0.1",
   "main": "lib/index.js",
@@ -16,5 +16,11 @@
   ],
   "peerDependencies": {
     "koishi": "4.17.12"
+  },
+  "dependencies": {
+    "cron-parser": "^4.9.0"
+  },
+  "devDependencies": {
+    "cron-parser": "^4.9.0"
   }
 }
