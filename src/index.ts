@@ -8,8 +8,11 @@
  * - 定时清理匹配数据
  * - 用户头像NSFW检测（基于NSFW.js本地检测，配对时触发）
  * 
+<<<<<<< HEAD
  * @author Matrix Agent
  * @version 1.2.0
+=======
+>>>>>>> 0013b3f718de081c9c46346bfba1ab9c0cbf8750
  */
 
 // 导入 Koishi 框架核心模块
