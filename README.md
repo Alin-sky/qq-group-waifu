@@ -1,4 +1,5 @@
-# qq-group-waifu
-适用于官方QQbot的抽群友咪
+# koishi-plugin-qq-wife
 
-在写
+[![npm](https://img.shields.io/npm/v/koishi-plugin-qq-wife?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-qq-wife)
+
+
