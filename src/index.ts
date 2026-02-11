@@ -6,9 +6,10 @@
  * - 支持结婚、离婚功能
  * - 生成趣味表情图（摸头、结婚等）
  * - 定时清理匹配数据
+ * - 用户头像NSFW检测（基于NSFW.js本地检测，配对时触发）
  * 
  * @author Matrix Agent
- * @version 1.0.0
+ * @version 1.2.0
  */
 
 // 导入 Koishi 框架核心模块
@@ -16,6 +17,10 @@ import { Context, h, Logger, Random, Schema } from 'koishi'
 
 // 导入 QQ 适配器
 import { } from '@satorijs/adapter-qq'
+
+// 导入 NSFW.js 和 TensorFlow.js（用于本地NSFW检测）
+import * as nsfwjs from 'nsfwjs'
+import * as tf from '@tensorflow/tfjs-node'
 
 // ============================================================================
 // 插件基本信息
@@ -40,6 +45,8 @@ export interface Config {
   meme_api: string
   /** 机器人AppID */
   bot_appId: string
+  /** NSFW检测阈值（0-1），超过此值视为NSFW */
+  nsfw_threshold?: number
 }
 
 /**
@@ -54,7 +61,9 @@ export const Config: Schema<Config> = Schema.object({
   /** 机器人AppID，用于获取用户头像 */
   bot_appId: Schema.string(),
   /** 表情包生成API地址 */
-  meme_api: Schema.string()
+  meme_api: Schema.string(),
+  /** NSFW检测阈值（0-1），超过此值视为NSFW，默认0.5 */
+  nsfw_threshold: Schema.number().min(0).max(1).step(0.1).default(0.5).description('NSFW检测阈值')
 })
 
 // ============================================================================
@@ -73,38 +82,42 @@ export const inject = { required: ['database'] }
 
 /**
  * 扩展 Koishi 的数据库表类型
- * 声明自定义表：qqwaifu_dbs（用户数据）、qqwaifu_db_marry（配对数据）
+ * 声明自定义表：waifu_dbs（用户数据）、waifu_marriage（配对数据）
  */
 declare module 'koishi' {
   interface Tables {
     /** 用户数据库 - 存储群成员状态信息 */
-    qqwaifu_dbs: qqwaifu_dbs
+    waifu_dbs: WaifuDatabase
     /** 婚姻数据库 - 存储用户配对关系 */
-    qqwaifu_db_marry: qqwaifu_db_marry
+    waifu_marriage: WaifuMarriage
   }
 }
 
 /**
- * 用户数据结构
+ * 用户数据库结构
  * 记录每个群成员的状态信息
  */
-export interface qqwaifu_dbs {
+export interface WaifuDatabase {
   /** 群ID（主键） */
   id: string
   /** 群成员列表 */
-  guilds: qqw_user_dbs[]
+  members: GuildMember[]
 }
 
 /**
  * 单个群成员的数据结构
  */
-export interface qqw_user_dbs {
+export interface GuildMember {
   /** 用户ID */
-  userid: string
+  userId: string
   /** 配对状态：true=已配对，false=未配对 */
-  status_u: boolean
+  isPaired: boolean
   /** 时间戳，记录用户最后活跃时间 */
-  timestemp: number
+  timestamp: number
+  /** NSFW检测结果缓存 */
+  nsfwScore?: number
+  /** 头像是否已检测过NSFW */
+  nsfwChecked?: boolean
 }
 
 /**
@@ -119,7 +132,7 @@ export interface Pairings {
  * 婚姻配对数据结构
  * 记录群内的所有配对关系
  */
-export interface qqwaifu_db_marry {
+export interface WaifuMarriage {
   /** 群ID（主键） */
   id: string
   /** 配对关系映射表 */
@@ -127,10 +140,34 @@ export interface qqwaifu_db_marry {
 }
 
 /**
+ * NSFW检测结果类型
+ */
+interface NsfwResult {
+  /** 是否检测到NSFW内容 */
+  isNsfw: boolean
+  /** NSFW置信度分数（0-1） */
+  score: number
+  /** 详细预测结果 */
+  predictions?: NsfwPrediction[]
+  /** 错误信息（如果有） */
+  error?: string
+}
+
+/**
+ * NSFW预测结果
+ */
+interface NsfwPrediction {
+  /** 类别名称 */
+  className: string
+  /** 置信度 */
+  probability: number
+}
+
+/**
  * Markdown消息格式类型
  * 用于发送富文本消息
  */
-type md_format = {
+type MarkdownFormat = {
   /** 消息ID（私聊用） */
   msg_id?: string
   /** 事件ID（频道用） */
@@ -144,6 +181,217 @@ type md_format = {
 }
 
 // ============================================================================
+// NSFW检测模块（基于NSFW.js）
+// ============================================================================
+
+/**
+ * NSFW检测器类
+ * 使用 NSFW.js 在本地进行图片检测
+ * 在配对时触发检测，而非用户发消息时就检测
+ */
+class NsfwDetector {
+  private threshold: number
+  private logger: Logger
+  private model: any = null
+  private modelLoaded: boolean = false
+  private loadingPromise: Promise<void> | null = null
+  
+  /** 缓存检测结果，避免重复检测 */
+  private cache: Map<string, NsfwResult> = new Map()
+  /** 检测中的请求，防止并发检测同一用户 */
+  private pending: Map<string, Promise<NsfwResult>> = new Map()
+
+  constructor(config: Config, logger: Logger) {
+    this.threshold = config.nsfw_threshold || 0.5
+    this.logger = logger
+  }
+
+  /**
+   * 异步加载NSFW模型
+   * 首次需要检测时自动调用
+   */
+  async ensureModelLoaded(): Promise<void> {
+    // 如果模型已加载，直接返回
+    if (this.modelLoaded && this.model) {
+      return
+    }
+
+    // 如果正在加载，等待加载完成
+    if (this.loadingPromise) {
+      return this.loadingPromise
+    }
+
+    // 开始加载模型
+    this.loadingPromise = this.doLoadModel()
+    
+    try {
+      await this.loadingPromise
+      this.modelLoaded = true
+      this.logger.info('NSFW模型加载成功')
+    } catch (error) {
+      this.logger.error(`NSFW模型加载失败: ${error}`)
+      this.loadingPromise = null
+      throw error
+    }
+  }
+
+  /**
+   * 执行模型加载
+   */
+  private async doLoadModel(): Promise<void> {
+    try {
+      this.logger.info('正在加载NSFW模型，请稍候...')
+      
+      // 启用TensorFlow.js生产模式以提升性能
+      tf.enableProdMode()
+      
+      // 加载NSFW.js模型
+      this.model = await nsfwjs.load()
+      
+      this.logger.info('NSFW模型加载完成')
+    } catch (error) {
+      this.logger.error(`加载NSFW模型时出错: ${error}`)
+      throw error
+    }
+  }
+
+  /**
+   * 检测图片是否为NSFW
+   * 
+   * @param imageBuffer - 图片Buffer数据
+   * @returns NSFW检测结果
+   */
+  async detect(imageBuffer: Buffer): Promise<NsfwResult> {
+    // 确保模型已加载
+    await this.ensureModelLoaded()
+
+    // 如果模型加载失败
+    if (!this.model) {
+      return { 
+        isNsfw: false, 
+        score: 0, 
+        error: 'NSFW模型未加载' 
+      }
+    }
+
+    try {
+      // 将Buffer转换为TensorFlow.js支持的图片格式
+      const imageTensor = tf.node.decodeImage(imageBuffer, 3)
+      
+      // 使用NSFW.js进行分类
+      const predictions = await this.model.classify(imageTensor)
+      
+      // 释放TensorFlow.js内存
+      imageTensor.dispose()
+
+      // 计算NSFW分数（综合Hentai、Porn、Sexy类别的最高分数）
+      let maxNsfwScore = 0
+      const nsfwCategories = ['Hentai', 'Porn', 'Sexy']
+      const detailedPredictions: NsfwPrediction[] = predictions.map((p: any) => ({
+        className: p.className,
+        probability: p.probability
+      }))
+
+      for (const pred of predictions) {
+        if (nsfwCategories.includes(pred.className)) {
+          if (pred.probability > maxNsfwScore) {
+            maxNsfwScore = pred.probability
+          }
+        }
+      }
+
+      const isNsfw = maxNsfwScore > this.threshold
+
+      this.logger.info(`NSFW检测完成: score=${maxNsfwScore.toFixed(4)}, isNsfw=${isNsfw}`)
+
+      return {
+        isNsfw,
+        score: maxNsfwScore,
+        predictions: detailedPredictions
+      }
+    } catch (error) {
+      this.logger.error(`NSFW检测失败: ${error}`)
+      return {
+        isNsfw: false,
+        score: 0,
+        error: String(error)
+      }
+    }
+  }
+
+  /**
+   * 通过URL检测图片
+   * 
+   * @param imageUrl - 图片URL
+   * @returns NSFW检测结果
+   */
+  async detectFromUrl(imageUrl: string): Promise<NsfwResult> {
+    // 检查缓存
+    const cached = this.cache.get(imageUrl)
+    if (cached) {
+      return cached
+    }
+
+    // 检查是否有正在进行的检测
+    const pending = this.pending.get(imageUrl)
+    if (pending) {
+      return pending
+    }
+
+    // 创建检测Promise并加入pending
+    const detectPromise = this.doDetectFromUrl(imageUrl)
+    this.pending.set(imageUrl, detectPromise)
+
+    try {
+      const result = await detectPromise
+// 缓存结果
+      this.cache.set(imageUrl, result)
+      return result
+    } finally {
+      this.pending.delete(imageUrl)
+    }
+  }
+
+  /**
+   * 执行URL图片检测
+   */
+  private async doDetectFromUrl(imageUrl: string): Promise<NsfwResult> {
+    try {
+      this.logger.info(`正在检测头像: ${imageUrl}`)
+
+      // 下载图片
+      const response = await tf.fetch(imageUrl)
+      const arrayBuffer = await response.arrayBuffer()
+      const imageBuffer = Buffer.from(arrayBuffer)
+
+      // 检测图片
+      return await this.detect(imageBuffer)
+    } catch (error) {
+      this.logger.error(`从URL检测图片失败: ${error}`)
+      return {
+        isNsfw: false,
+        score: 0,
+        error: String(error)
+      }
+    }
+  }
+
+  /**
+   * 清除缓存
+   */
+  clearCache(): void {
+    this.cache.clear()
+  }
+
+  /**
+   * 检查模型是否已加载
+   */
+  isModelLoaded(): boolean {
+    return this.modelLoaded
+  }
+}
+
+// ============================================================================
 // 核心功能函数
 // ============================================================================
 
@@ -152,26 +400,26 @@ type md_format = {
  * 支持 QQ 和 QQ频道 两种平台的消息发送
  * 
  * @param session - Koishi会话对象
- * @param md - Markdown消息格式
+ * @param markdownMessage - Markdown消息格式
  */
-export async function send_md_mess(session, md: md_format) {
+export async function sendMarkdownMessage(session, markdownMessage: MarkdownFormat) {
   try {
     // 判断平台类型
     if (session.event.platform == 'qq') {
       // 判断是否为群聊还是私聊
       if (session.event.guild) {
         // 群聊消息发送
-        await session.qq.sendMessage(session.channelId, md)
+        await session.qq.sendMessage(session.channelId, markdownMessage)
       } else {
         // 私聊消息发送
-        await session.qq.sendPrivateMessage(session.event.user.id, md)
+        await session.qq.sendPrivateMessage(session.event.user.id, markdownMessage)
       }
     } else if (session.event.platform == 'qqguild') {
       // QQ频道消息发送
-      await session.qqguild.sendMessage(session.event.channel.id, md)
+      await session.qqguild.sendMessage(session.event.channel.id, markdownMessage)
     }
-  } catch (e) {
-    console.log(e)
+  } catch (error) {
+    console.error('发送消息失败:', error)
   }
 }
 
@@ -193,39 +441,50 @@ export async function apply(ctx: Context, config: Config) {
   
   /**
    * 创建用户数据表
-   * 表名：qqwaifu_dbs
-   * 字段：id（群ID）, guilds（群成员列表，JSON格式）
+   * 表名：waifu_dbs
+   * 字段：id（群ID）, members（群成员列表，JSON格式）
    */
-  ctx.model.extend('qqwaifu_dbs', {
+  ctx.model.extend('waifu_dbs', {
     id: "string",
-    guilds: "json",
+    members: "json",
   })
   
   /**
    * 创建婚姻配对表
-   * 表名：qqwaifu_db_marry
+   * 表名：waifu_marriage
    * 字段：id（群ID）, pairings（配对关系，JSON格式）
    */
-  ctx.model.extend('qqwaifu_db_marry', {
+  ctx.model.extend('waifu_marriage', {
     id: "string",
     pairings: "json"
   })
 
   // 初始化日志记录器
-  const log1 = "qq-guild-waifu"
-  const log: Logger = new Logger(log1)
+  const loggerName = "qq-guild-waifu"
+  const logger: Logger = new Logger(loggerName)
   
   // 初始化随机数生成器
   const random = new Random(() => Math.random())
 
   // 机器人信息存储（用于配对到机器人时使用）
-  const bots_ass = {
+  const botInfo = {
     id: '',
-    url: ''
+    avatar: ''
   }
 
   // -------------------------------------------------------------------------
-  // 2. 定时任务调度
+  // 2. NSFW检测器初始化（基于NSFW.js，默认启用）
+  // -------------------------------------------------------------------------
+  
+  /**
+   * 初始化NSFW检测器
+   * 模型会在首次配对时自动加载
+   */
+  const nsfwDetector = new NsfwDetector(config, logger)
+  logger.info('NSFW检测模块已初始化，将在配对时自动检测头像')
+
+  // -------------------------------------------------------------------------
+  // 3. 定时任务调度
   // -------------------------------------------------------------------------
 
   /**
@@ -254,102 +513,138 @@ export async function apply(ctx: Context, config: Config) {
    * 每天午夜执行，清空所有配对记录
    * 实现每日重新配对的功能
    */
-  async function delet_wifes(): Promise<void> {
-    console.log("执行任务，当前时间：", new Date());
+  async function clearAllMarriages(): Promise<void> {
+    logger.info("执行每日清理任务，当前时间：", new Date());
     // 清空配对表
-    await ctx.database.remove("qqwaifu_db_marry", {})
-    console.log(await ctx.database.get("qqwaifu_db_marry", {}))
+    await ctx.database.remove("waifu_marriage", {})
+    logger.info("配对数据已清空")
+    
+    // 同时清除NSFW检测缓存
+    nsfwDetector.clearCache()
+    logger.info("NSFW检测缓存已清除")
   }
 
   // 启动定时任务（每日午夜清理配对数据）
-  await scheduleMidnightTask(delet_wifes);
+  await scheduleMidnightTask(clearAllMarriages);
 
   // -------------------------------------------------------------------------
-  // 3. 用户数据管理
+  // 4. 用户数据管理
   // -------------------------------------------------------------------------
+
+  /**
+   * 生成用户头像URL
+   * 
+   * @param userId - 用户ID
+   * @returns 头像URL
+   */
+  function getAvatarUrl(userId: string): string {
+    return `https://q.qlogo.cn/qqapp/${config.bot_appId}/${userId}/640`
+  }
+
+  /**
+   * 检测用户头像是否为NSFW（基于NSFW.js，在配对时调用）
+   * 
+   * @param userId - 用户ID
+   * @returns NSFW检测结果
+   */
+  async function checkUserAvatarNsfw(userId: string): Promise<NsfwResult> {
+    const avatarUrl = getAvatarUrl(userId)
+    return await nsfwDetector.detectFromUrl(avatarUrl)
+  }
 
   /**
    * 保存/更新用户数据
    * 当用户首次使用或每次使用时更新其时间戳
+   * 不进行NSFW检测，检测在配对时进行
    * 
    * @param session - Koishi会话对象
    */
-  let i = 0
-  async function save_user(session) {
+  async function saveUser(session: any): Promise<void> {
     // 从数据库获取当前群的用户数据
-    const user_data = (await ctx.database.get("qqwaifu_dbs", session.event.guild?.id))
+    const guildData = (await ctx.database.get("waifu_dbs", session.event.guild?.id))
     // 计算刷新时间点（当天的config.hours点）
-    const etime = new Date().setHours(config.hours, 0, 0, 0)
-    let indata: qqw_user_dbs
+    const refreshTime = new Date().setHours(config.hours, 0, 0, 0)
+    let memberData: GuildMember
     
     // 情况1：群数据为空，创建新记录
-    if (user_data.length == 0) {
-      await ctx.database.upsert('qqwaifu_dbs', () => [
+    if (guildData.length == 0) {
+      await ctx.database.upsert('waifu_dbs', () => [
         {
           id: session.event.guild.id,
-          guilds: [
+          members: [
             {
-              userid: session.event.user.id,
-              status_u: false,
-              timestemp: etime
+              userId: session.event.user.id,
+              isPaired: false,
+              timestamp: refreshTime,
+              nsfwScore: 0,
+              nsfwChecked: false  // 初始为false，配对时再检测
             },
             {
-              userid: "bots",  // 保留机器人位置，用于与机器人配对
-              status_u: false,
-              timestemp: 17000000000000  // 一个很远的未来时间
+              userId: "bot",  // 保留机器人位置，用于与机器人配对
+              isPaired: false,
+              timestamp: 17000000000000,
+              nsfwScore: 0,
+              nsfwChecked: true
             },
           ],
         }
       ])
     } 
     // 情况2：用户已有记录，检查是否需要更新
-    else if ((user_data[0].guilds).find(a => a.userid == session.event.user.id)) {
-      const ind = user_data[0].guilds.findIndex(a => a.userid == session.event.user.id)
+    else if ((guildData[0].members).find(member => member.userId == session.event.user.id)) {
+      const memberIndex = guildData[0].members.findIndex(member => member.userId == session.event.user.id)
+      const existingMember = guildData[0].members[memberIndex]
       
       // 如果新的刷新时间晚于记录时间，更新时间戳并重置配对状态
-      if (etime > user_data[0].guilds[ind].timestemp) {
-        indata = {
-          userid: session.event.user.id,
-          status_u: false,
-          timestemp: etime
+      if (refreshTime > existingMember.timestamp) {
+        memberData = {
+          userId: session.event.user.id,
+          isPaired: false,
+          timestamp: refreshTime,
+          nsfwScore: existingMember.nsfwScore || 0,
+          nsfwChecked: existingMember.nsfwChecked || false
         }
-        user_data[0].guilds[ind] = indata
+        guildData[0].members[memberIndex] = memberData
       } 
       // 如果在同一天，只更新时间戳，保持配对状态
-      else if (etime <= user_data[0].guilds[ind].timestemp) {
-        indata = {
-          userid: session.event.user.id,
-          status_u: user_data[0].guilds[ind].status_u,
-          timestemp: etime
+      else if (refreshTime <= existingMember.timestamp) {
+        memberData = {
+          userId: session.event.user.id,
+          isPaired: existingMember.isPaired,
+          timestamp: refreshTime,
+          nsfwScore: existingMember.nsfwScore || 0,
+          nsfwChecked: existingMember.nsfwChecked || false
         }
-        user_data[0].guilds[ind] = indata
+        guildData[0].members[memberIndex] = memberData
       }
       // 更新到数据库
-      await ctx.database.upsert('qqwaifu_dbs', () => [
+      await ctx.database.upsert('waifu_dbs', () => [
         {
           id: session.event.guild.id,
-          guilds: user_data[0].guilds,
+          members: guildData[0].members,
         }
       ])
     } 
     // 情况3：新用户加入，追加到群用户列表
     else {
-      indata = {
-        userid: session.event.user.id,
-        status_u: false,
-        timestemp: etime
+      memberData = {
+        userId: session.event.user.id,
+        isPaired: false,
+        timestamp: refreshTime,
+        nsfwScore: 0,
+        nsfwChecked: false  // 配对时再检测
       };
-      (user_data[0].guilds).push(indata)
+      (guildData[0].members).push(memberData)
 
       try {
-        await ctx.database.upsert('qqwaifu_dbs', () => [
+        await ctx.database.upsert('waifu_dbs', () => [
           {
             id: session.event.guild?.id,
-            guilds: user_data[0].guilds,
+            members: guildData[0].members,
           }
         ])
-      } catch (e) {
-        console.log(e)
+      } catch (error) {
+        logger.error('保存用户数据失败:', error)
         return
       }
     }
@@ -358,53 +653,94 @@ export async function apply(ctx: Context, config: Config) {
   /**
    * 获取可配对的群成员
    * 根据用户活跃时间和配对状态筛选可用用户
+   * 在配对时触发NSFW检测
    * 
-   * @param guild_users - 群成员列表
+   * @param members - 群成员列表
    * @param session - Koishi会话对象
-   * @returns 配对成功的用户对象，或false（无可配对用户）
+   * @returns 配对成功的用户对象，或null（无可配对用户）
    */
-  async function ga_user(guild_users: qqw_user_dbs[], session) {
+  async function getAvailablePartner(members: GuildMember[], session: any): Promise<GuildMember | null> {
     // 获取当天刷新时间点
-    const etime = new Date().setHours(config.hours, 0, 0, 0)
+    const refreshTime = new Date().setHours(config.hours, 0, 0, 0)
+    const dayInMilliseconds = 86400000
+    const expirationThreshold = config.days * dayInMilliseconds
 
     // 遍历所有群成员
-    for (let i = 0; i < guild_users.length; i++) {
+    for (let i = 0; i < members.length; i++) {
       // 计算距离上次刷新的时间差
-      const calcula = etime - (guild_users[i].timestemp)
+      const timeDiff = refreshTime - (members[i].timestamp)
       
       // 如果超过配置的天数，移除该用户
-      if (calcula >= (config.days * 86400000)) {
-        guild_users.splice(i, 1)
+      if (timeDiff >= expirationThreshold) {
+        members.splice(i, 1)
       } 
       // 如果在配置天数内但不为0，重置其配对状态为未配对
-      else if (calcula < (config.days * 86400000) && calcula != 0) {
-        guild_users[i].status_u = false
+      else if (timeDiff < expirationThreshold && timeDiff != 0) {
+        members[i].isPaired = false
       }
     }
     
     // 筛选出未配对的用户
-    const l_1 = guild_users.filter((i) => i.status_u == false)
-    // 排除自己
-    const l_2 = l_1.filter(i => i.userid != session.event.user.id)
+    let availableUsers = members.filter(member => member.isPaired === false)
     
-    // 更新数据库
-    ctx.database.upsert("qqwaifu_dbs", [{
+    // 在配对时进行NSFW检测，过滤掉NSFW头像的用户
+    const safeUsers: GuildMember[] = []
+    for (const user of availableUsers) {
+      // 跳过机器人
+      if (user.userId === 'bot') {
+        safeUsers.push(user)
+        continue
+      }
+      
+      // 如果用户头像未检测过，进行NSFW检测
+      if (!user.nsfwChecked) {
+        try {
+          const nsfwResult = await checkUserAvatarNsfw(user.userId)
+          user.nsfwScore = nsfwResult.score
+          user.nsfwChecked = true
+          
+          if (nsfwResult.isNsfw) {
+            logger.info(`用户 ${user.userId} 因NSFW头像被排除，分数: ${nsfwResult.score.toFixed(4)}`)
+            continue  // 跳过此用户
+          }
+        } catch (error) {
+          // 检测失败时记录错误但继续使用该用户
+          logger.error(`检测用户 ${user.userId} 头像失败: ${error}`)
+          user.nsfwChecked = true  // 标记为已检测，避免重复检测
+        }
+      }
+      
+      // 如果已检测且分数超过阈值，排除该用户
+      if (user.nsfwChecked && user.nsfwScore && user.nsfwScore > (config.nsfw_threshold || 0.5)) {
+        logger.info(`用户 ${user.userId} 因NSFW头像被排除，分数: ${user.nsfwScore.toFixed(4)}`)
+        continue  // 跳过此用户
+      }
+      
+      safeUsers.push(user)
+    }
+    availableUsers = safeUsers
+    
+    // 排除自己
+    const finalAvailableUsers = availableUsers.filter(member => member.userId != session.event.user.id)
+    
+    // 更新数据库（包含NSFW检测结果）
+    ctx.database.upsert("waifu_dbs", [{
       id: session.event.guild.id,
-      guilds: guild_users
+      members: members
     }])
 
-    // 如果没有可配对用户，返回false
-    if (l_2.length == 0) {
-      return false
+    // 如果没有可配对用户，返回null
+    if (finalAvailableUsers.length == 0) {
+      return null
     } else {
       // 随机选择一个用户作为"老婆"
-      const wife = random.pick(l_2)
-      return wife
+      const partner = random.pick(finalAvailableUsers)
+      return partner
     }
   }
 
   // -------------------------------------------------------------------------
-  // 4. 中间件处理
+  // 5. 中间件处理
   // -------------------------------------------------------------------------
 
   /**
@@ -416,53 +752,67 @@ export async function apply(ctx: Context, config: Config) {
     if (!session.event.guild) {
       return next()
     } else {
-      // 保存用户数据
-      await save_user(session)
+      // 保存用户数据（不进行NSFW检测，检测在配对时进行）
+      await saveUser(session)
       return next()
     }
   }, true)
 
   // -------------------------------------------------------------------------
-  // 5. 按钮交互处理
+  // 6. 按钮交互处理
   // -------------------------------------------------------------------------
+
+  /**
+   * 表情包类型枚举
+   */
+  enum MemeType {
+    PetPet = 0,    // 摸头
+    Marriage = 1,   // 结婚
+    Clown = 2,     // 小丑
+    Divorce = 3     // 离婚
+  }
 
   /**
    * 处理按钮交互事件
    * 包括：结婚证、摸头、查看菜单等按钮
    */
-  ctx.on("interaction/button", async sess => {
+  ctx.on("interaction/button", async (session: any) => {
     // 先保存用户数据
-    await save_user(sess)
+    await saveUser(session)
     
     // 解析按钮数据（格式："操作名 参数1 参数2"）
-    const int_butt_data = sess.event.button['data'].split(' ')
+    const buttonData = session.event.button['data'].split(' ')
     
     // 根据操作类型处理
-    switch (int_butt_data[0]) {
+switch (buttonData[0]) {
       case 'meme-jiehun':
         // 生成结婚证图片
-        let uuuuu
+        let targetUserId: string
         // 判断是本人还是对方
-        if (int_butt_data[1] == sess.event.user.id) {
-          uuuuu = int_butt_data[2]
-        } else { uuuuu = int_butt_data[1] }
-        const tutu = await create_meme(uuuuu, 1)
-        sess.send(h.image(tutu, 'image/jpg'))
+        if (buttonData[1] == session.event.user.id) {
+          targetUserId = buttonData[2]
+        } else { 
+          targetUserId = buttonData[1] 
+        }
+        const marriageMeme = await generateMemeImage(targetUserId, MemeType.Marriage)
+        session.send(h.image(marriageMeme, 'image/jpg'))
         break;
         
       case "meme-momotou":
         // 生成摸头图片
-        let uuuu
-        if (int_butt_data[1] == sess.event.user.id) {
-          uuuu = int_butt_data[2]
-        } else { uuuu = int_butt_data[1] }
-        const tutu2 = await create_meme(uuuu, 0)
-        sess.send(h.image(tutu2, 'image/jpg'))
+        let petUserId: string
+        if (buttonData[1] == session.event.user.id) {
+          petUserId = buttonData[2]
+        } else { 
+          petUserId = buttonData[1] 
+        }
+        const petMeme = await generateMemeImage(petUserId, MemeType.PetPet)
+        session.send(h.image(petMeme, 'image/jpg'))
         break;
         
       case "/wife":
         // 执行查看老婆命令
-        return sess.execute('wife')
+        return session.execute('wife')
     }
   })
 
@@ -470,25 +820,25 @@ export async function apply(ctx: Context, config: Config) {
    * 获取用户的老婆信息
    * 
    * @param session - Koishi会话对象
-   * @returns 配对信息对象，或false（未配对）
+   * @returns 配对信息对象，或null（未配对）
    */
-  async function get_user_wife(session) {
+  async function getUserPartner(session: any): Promise<{ userId: string, partnerId: string } | null> {
     // 从数据库获取当前群的配对数据
-    let wife_data: qqwaifu_db_marry[] = await ctx.database.get("qqwaifu_db_marry", session.channelId)
+    const marriageData: WaifuMarriage[] = await ctx.database.get("waifu_marriage", session.channelId)
     
     // 如果没有配对数据
-    if (wife_data.length == 0) {
-      return false
+    if (marriageData.length == 0) {
+      return null
     } else {
       // 查找当前用户的配对对象
-      const wifesss = wife_data[0].pairings[session.event.user.id]
-      if (wifesss) {
+      const partnerId = marriageData[0].pairings[session.event.user.id]
+      if (partnerId) {
         return {
-          id: session.event.user.id,
-          id2: wifesss
+          userId: session.event.user.id,
+          partnerId: partnerId
         }
       } else {
-        return false
+        return null
       }
     }
   }
@@ -497,27 +847,27 @@ export async function apply(ctx: Context, config: Config) {
    * 构建Markdown消息内容和键盘按钮
    * 生成完整的消息卡片
    * 
-   * @param opti - 是否@对方
-   * @param wife - 配对信息
+   * @param shouldNotAt - 是否@对方
+   * @param partnerInfo - 配对信息
    * @param session - Koishi会话对象
    * @returns 完整的消息对象
    */
-  function send_md(opti: boolean, wife: { id: string, id2: string }, session) {
-    let usid
-    let uurl
+  function buildMessage(shouldNotAt: boolean, partnerInfo: { userId: string, partnerId: string }, session: any): any {
+    let partnerUserId: string
+    let partnerAvatarUrl: string
     
     // 处理机器人配对情况
-    if (wife.id2 == "bots") {
-      usid = bots_ass.id
-      uurl = bots_ass.url
+    if (partnerInfo.partnerId == "bot") {
+      partnerUserId = botInfo.id
+      partnerAvatarUrl = botInfo.avatar
     } else {
-      usid = wife.id2
+      partnerUserId = partnerInfo.partnerId
       // 生成QQ头像URL
-      uurl = `https://q.qlogo.cn/qqapp/${session.bot.config.id}/${wife.id2}/640`
+      partnerAvatarUrl = getAvatarUrl(partnerInfo.partnerId)
     }
 
     // 构建Markdown消息
-    let mdp = {
+    let messagePayload: any = {
       msg_type: 2,
       event_id: session.event._data.id,
       markdown: {
@@ -525,29 +875,29 @@ export async function apply(ctx: Context, config: Config) {
           + session.event.user.id +
           "' />\n" +
           "💓您今天的老婆群友是：\n" +
-          "![img #100px #100px](" + uurl + ")"
+          "![img #100px #100px](" + partnerAvatarUrl + ")"
       },
     }
 
     // 处理消息ID
-    let mess_id = session.messageId ? session.messageId : session.event._data.id
+    let messageId = session.messageId ? session.messageId : session.event._data.id
     if (session.messageId) {
-      delete mdp.event_id;
-      mdp['msg_id'] = mess_id
+      delete messagePayload.event_id;
+      messagePayload['msg_id'] = messageId
     }
 
     // 如果选择不@对方，修改消息内容
-    if (opti == false) {
-      mdp.markdown = {
-        content: `<qqbot-at-user id="${wife.id}" />
+    if (shouldNotAt == false) {
+      messagePayload.markdown = {
+        content: `<qqbot-at-user id="${partnerInfo.userId}" />
 💓您今天的老婆群友是：
-<qqbot-at-user id="${usid}" />
-![img #100px #100px](${uurl})`
+<qqbot-at-user id="${partnerUserId}" />
+![img #100px #100px](${partnerAvatarUrl})`
       }
     }
 
     // 构建键盘按钮
-    mdp['keyboard'] = {
+    messagePayload['keyboard'] = {
       content: {
         rows: [
           {
@@ -582,9 +932,9 @@ export async function apply(ctx: Context, config: Config) {
                   type: 1,
                   permission: {
                     type: 0,
-                    specify_user_ids: [session.event.user.id, wife.id2]
+                    specify_user_ids: [session.event.user.id, partnerInfo.partnerId]
                   },
-                  data: `meme-momotou ${wife.id2} ${session.event.user.id}`
+                  data: `meme-momotou ${partnerInfo.partnerId} ${session.event.user.id}`
                 },
               },
               {
@@ -594,9 +944,9 @@ export async function apply(ctx: Context, config: Config) {
                   type: 1,
                   permission: {
                     type: 0,
-                    specify_user_ids: [session.event.user.id, wife.id2]
+                    specify_user_ids: [session.event.user.id, partnerInfo.partnerId]
                   },
-                  data: `meme-jiehun ${wife.id2} ${session.event.user.id}`,
+                  data: `meme-jiehun ${partnerInfo.partnerId} ${session.event.user.id}`,
                 },
               },
             ],
@@ -604,65 +954,65 @@ export async function apply(ctx: Context, config: Config) {
         ],
       },
     }
-    return mdp
+    return messagePayload
   }
 
   /**
    * 生成表情包图片
    * 调用外部API生成趣味图片
    * 
-   * @param userid - 用户ID
-   * @param type - 图片类型：0=摸头, 1=结婚, 2=小丑, 3=离婚
+   * @param userId - 用户ID
+   * @param memeType - 图片类型枚举
    * @returns 生成的图片数据
    */
-  async function create_meme(userid: string, type: number) {
-    let utext
-    let json_opt = {}
+  async function generateMemeImage(userId: string, memeType: MemeType): Promise<any> {
+    let memeTypeText: string
+    let memeOptions: Record<string, any> = {}
     
     // 根据类型设置API参数
-    switch (type) {
-      case 0:
-        utext = 'petpet'
-        json_opt = { "user_infos": [], "circle": true }
+    switch (memeType) {
+      case MemeType.PetPet:
+        memeTypeText = 'petpet'
+        memeOptions = { "user_infos": [], "circle": true }
         break;
-      case 1:
-        utext = 'marriage'
-        json_opt = { "user_infos": [] }
+      case MemeType.Marriage:
+        memeTypeText = 'marriage'
+        memeOptions = { "user_infos": [] }
         break;
-      case 2:
-        utext = "clown_mask"
-        json_opt = { "mode": "behind" }
+      case MemeType.Clown:
+        memeTypeText = "clown_mask"
+        memeOptions = { "mode": "behind" }
         break;
-      case 3:
-        utext = "divorce"
-        json_opt = { "user_infos": [] }
+      case MemeType.Divorce:
+        memeTypeText = "divorce"
+        memeOptions = { "user_infos": [] }
     }
     
     // 获取用户头像
-    let img_url
-    if (userid == 'bots') {
-      img_url = bots_ass.url
+    let avatarUrl: string
+    if (userId == 'bot') {
+      avatarUrl = botInfo.avatar
     } else {
-      img_url = `https://q.qlogo.cn/qqapp/${config.bot_appId}/${userid}/640`
+      avatarUrl = getAvatarUrl(userId)
     }
 
     // 下载头像图片
-    const uarry = await ctx.http.get(img_url);
+    const avatarData = await ctx.http.get(avatarUrl);
     
     // 创建FormData用于文件上传
-    const formData = new FormData();
-    formData.append('images', new Blob([uarry]), 'image.png');
-    formData.append('texts', '');
-    formData.append('args', JSON.stringify(json_opt));
+    const requestFormData = new FormData();
+    requestFormData.append('images', new Blob([avatarData]), 'image.png');
+    requestFormData.append('texts', '');
+    requestFormData.append('args', JSON.stringify(memeOptions));
     
     // 调用表情包API生成图片
-    const out = await ctx.http.post(`${config.meme_api}/memes/${utext}/`, formData);
+    const memeResult = await ctx.http.post(`${config.meme_api}/memes/${memeTypeText}/`, requestFormData);
 
-    return out
+    return memeResult
   }
 
   // ============================================================================
-  // 6. 命令定义
+  // 7. 命令定义
   // ============================================================================
 
   /**
@@ -672,7 +1022,7 @@ export async function apply(ctx: Context, config: Config) {
   ctx.command("离婚")
     .action(async ({ session }) => {
       // 未配对时的提示消息
-      const no_user_md = {
+      const noMatchMessage = {
         msg_type: 2,
         msg_id: session.messageId,
         markdown: {
@@ -683,78 +1033,81 @@ export async function apply(ctx: Context, config: Config) {
       }
       
       // 获取配对数据
-      let wifes = await ctx.database.get("qqwaifu_db_marry", session.channelId)
-      const user_data = (await ctx.database.get("qqwaifu_dbs", session.channelId))[0]
-      let tutu2
+      let marriages = await ctx.database.get("waifu_marriage", session.channelId)
+      const guildData = (await ctx.database.get("waifu_dbs", session.channelId))[0]
+      let divorceMeme: any
       
       // 检查是否有配对数据
-      if (wifes.length == 0) {
-        session.qq.sendMessage(session.channelId, no_user_md)
+      if (marriages.length == 0) {
+        session.qq.sendMessage(session.channelId, noMatchMessage)
         return
       } else {
         // 检查当前用户是否有配对
-        if (wifes[0].pairings[session.event.user.id]) {
+        if (marriages[0].pairings[session.event.user.id]) {
           // 获取配对对象ID
-          const keys = wifes[0].pairings[session.event.user.id]
+          const partnerId = marriages[0].pairings[session.event.user.id]
           // 生成离婚表情包
-          tutu2 = await create_meme(keys, 3)
+          divorceMeme = await generateMemeImage(partnerId, MemeType.Divorce)
           
           // 双向解除配对关系
-          const keys_1 = wifes[0].pairings[keys]
-          const keys_2 = wifes[0].pairings[session.event.user.id]
-          delete wifes[0].pairings[keys]
-          delete wifes[0].pairings[session.event.user.id]
+          const user1Id = marriages[0].pairings[partnerId]
+          const user2Id = marriages[0].pairings[session.event.user.id]
+          delete marriages[0].pairings[partnerId]
+          delete marriages[0].pairings[session.event.user.id]
           
           // 更新用户状态为未配对
-          const ind_u1 = user_data.guilds.findIndex(a => a.userid == keys_1)
-          const ind_u2 = user_data.guilds.findIndex(a => a.userid == keys_2)
+          const user1Index = guildData.members.findIndex(member => member.userId == user1Id)
+          const user2Index = guildData.members.findIndex(member => member.userId == user2Id)
 
           // 保存到数据库
-          await ctx.database.upsert("qqwaifu_db_marry", () => [{
+          await ctx.database.upsert("waifu_marriage", () => [{
             id: session.channelId,
-            pairings: wifes[0].pairings
+            pairings: marriages[0].pairings
           }])
-          user_data.guilds[ind_u1] = {
-            ...user_data.guilds[ind_u1],
-            status_u: false
+          
+          if (user1Index !== -1) {
+            guildData.members[user1Index] = {
+              ...guildData.members[user1Index],
+              isPaired: false
+            }
           }
-          user_data.guilds[ind_u2] = {
-            ...user_data.guilds[ind_u2],
-            status_u: false
+          if (user2Index !== -1) {
+            guildData.members[user2Index] = {
+              ...guildData.members[user2Index],
+              isPaired: false
+            }
           }
-          await ctx.database.upsert("qqwaifu_dbs", () => [
+          await ctx.database.upsert("waifu_dbs", () => [
             {
               id: session.event.guild?.id,
-              guilds: user_data.guilds
+              members: guildData.members
             }
           ])
         } else {
           // 未配对
-          session.qq.sendMessage(session.channelId, no_user_md)
+          session.qq.sendMessage(session.channelId, noMatchMessage)
           return
         }
       }
       // 发送离婚表情包
-      session.send((h.image(tutu2, 'image/jpg')))
+      session.send((h.image(divorceMeme, 'image/jpg')))
       return
     })
 
   /**
    * 查看老婆命令
-   * 配对或查看今日老婆
+   * 配对或查看今日老婆（此时触发NSFW检测）
    */
-  let ii = 0
   ctx.command('wife')
     .option('notat', '-n 不@对方')
     .option("console", "-c")
     .action(async ({ session, options }) => {
       // 记录机器人信息
-      bots_ass.id = session.bot.user.name
-      bots_ass.url = session.bot.user.avatar
-      console.log(ii++)
+      botInfo.id = session.bot.user.name
+      botInfo.avatar = session.bot.user.avatar
       
       // 无可用用户时的提示
-      const no_user_md = {
+      const noMatchMessage = {
         msg_type: 2,
         msg_id: session.messageId,
         markdown: {
@@ -765,71 +1118,71 @@ export async function apply(ctx: Context, config: Config) {
       }
       
       // 先检查是否已有配对
-      const wife_data = await get_user_wife(session)
+      const existingPartner = await getUserPartner(session)
       
       // 如果已有配对，直接显示
-      if (wife_data) {
-        let bools = options.notat ? true : false
-        const mdt = send_md(bools, wife_data, session)
-        session.qq.sendMessage(session.channelId, mdt)
+      if (existingPartner) {
+        const shouldNotAt = options.notat ? true : false
+        const messagePayload = buildMessage(shouldNotAt, existingPartner, session)
+        session.qq.sendMessage(session.channelId, messagePayload)
         return
       }
       
       // 获取用户数据
-      let user_data = (await ctx.database.get("qqwaifu_dbs", session.event.guild.id))[0]
+      let guildData = (await ctx.database.get("waifu_dbs", session.event.guild.id))[0]
 
       // 检查用户数据是否存在
-      if (!(user_data?.guilds)) {
-        session.qq.sendMessage(session.channelId, no_user_md)
+      if (!(guildData?.members)) {
+        session.qq.sendMessage(session.channelId, noMatchMessage)
         return
       } 
       // 检查是否有足够的用户（至少需要2个用户才能配对）
-      else if (user_data.guilds.length <= 2) {
-        session.qq.sendMessage(session.channelId, no_user_md)
+      else if (guildData.members.length <= 2) {
+        session.qq.sendMessage(session.channelId, noMatchMessage)
         return
       }
       
-      // 执行配对
-      const wifes = await ga_user(user_data.guilds, session)
-      let indx_udata_u1
-      let indx_udata_u2
+      // 执行配对（此时触发NSFW检测）
+      const availablePartner = await getAvailablePartner(guildData.members, session)
+      let partnerIndex: number
+      let userIndex: number
       
       // 如果配对失败
-      if (wifes == false) {
-        session.qq.sendMessage(session.channelId, no_user_md)
+      if (!availablePartner) {
+        session.qq.sendMessage(session.channelId, noMatchMessage)
         return
       } else {
         // 记录配对用户的索引
-        indx_udata_u1 = user_data.guilds.findIndex(i => wifes.userid == i.userid)
-        indx_udata_u2 = user_data.guilds.findIndex(i => session.event.user.id == i.userid)
+        partnerIndex = guildData.members.findIndex(member => availablePartner.userId == member.userId)
+        userIndex = guildData.members.findIndex(member => session.event.user.id == member.userId)
       }
       
       // 更新配对状态
-      if (wifes.userid == 'bots') {
+      if (availablePartner.userId == 'bot') {
         // 与机器人配对，不需要特殊处理
       } else {
-        user_data.guilds[indx_udata_u1] = {
-          ...user_data.guilds[indx_udata_u1],
-          status_u: true,
+        guildData.members[partnerIndex] = {
+          ...guildData.members[partnerIndex],
+          isPaired: true,
         }
       }
-      user_data.guilds[indx_udata_u2] = {
-        ...user_data.guilds[indx_udata_u2],
-        status_u: true,
+      guildData.members[userIndex] = {
+        ...guildData.members[userIndex],
+        isPaired: true,
       }
       
       // 保存用户状态到数据库
-      await ctx.database.upsert("qqwaifu_dbs", [{
+      await ctx.database.upsert("waifu_dbs", [{
         id: session.event.guild.id,
-        guilds: user_data.guilds
+        members: guildData.members
       }])
       
       // 保存配对关系到数据库
       const guildId = session.event.guild.id;
       const userId = session.event.user.id;
-      const wifeId = wifes.userid;
-      const existingData = await ctx.database.get("qqwaifu_db_marry", guildId);
-      let dataToUpdate;
+      const partnerId = availablePartner.userId;
+      const existingData = await ctx.database.get("waifu_marriage", guildId);
+      let dataToUpdate: WaifuMarriage;
       
       if (Array.isArray(existingData) && existingData.length > 0) {
         dataToUpdate = existingData[0];
@@ -838,19 +1191,23 @@ export async function apply(ctx: Context, config: Config) {
       }
       
       // 双向配对记录
-      dataToUpdate.pairings[userId] = wifeId;
-      if (wifeId == 'bots') {
+      dataToUpdate.pairings[userId] = partnerId;
+      if (partnerId == 'bot') {
         // 与机器人配对
       } else {
-        dataToUpdate.pairings[wifeId] = userId;
+        dataToUpdate.pairings[partnerId] = userId;
       }
 
-      ctx.database.upsert("qqwaifu_db_marry", [dataToUpdate]);
+      ctx.database.upsert("waifu_marriage", [dataToUpdate]);
       
       // 发送配对结果消息
-      let boolss = options.notat ? true : false
-      const mdss = send_md(boolss, { id: session.event.user.id, id2: wifes.userid }, session)
-      await session.qq.sendMessage(session.channelId, mdss)
+      const shouldNotAtResult = options.notat ? true : false
+      const resultMessage = buildMessage(
+        shouldNotAtResult, 
+        { userId: session.event.user.id, partnerId: availablePartner.userId }, 
+        session
+      )
+      await session.qq.sendMessage(session.channelId, resultMessage)
       return
     })
 
