@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-qq-wife",
-  "description": "",
-  "version": "0.0.1",
+  "description": "QQ群老婆配对插件，支持NSFW头像检测",
+  "version": "1.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -18,9 +18,11 @@
     "koishi": "4.17.12"
   },
   "dependencies": {
-    "cron-parser": "^4.9.0"
+    "@tensorflow/tfjs-node": "^4.21.0",
+    "nsfwjs": "^2.4.2"
   },
   "devDependencies": {
-    "cron-parser": "^4.9.0"
+    "@tensorflow/tfjs-node": "^4.21.0",
+    "nsfwjs": "^2.4.2"
   }
 }
